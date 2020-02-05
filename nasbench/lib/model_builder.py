@@ -105,12 +105,13 @@ def build_model_fn(spec, config, num_train_images):
       # compute the loss or anything dependent on it (i.e., the gradients).
       loss = tf.constant(0.0)
     else:
-      loss = tf.losses.softmax_cross_entropy(
-          onehot_labels=tf.one_hot(labels, config['num_labels']),
-          logits=logits)
+      with tf.variable_scope('xent_weight_decay'):
+        loss = tf.losses.softmax_cross_entropy(
+            onehot_labels=tf.one_hot(labels, config['num_labels']),
+            logits=logits)
 
-      loss += config['weight_decay'] * tf.add_n(
-          [tf.nn.l2_loss(v) for v in tf.trainable_variables()])
+        loss += config['weight_decay'] * tf.add_n(
+            [tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 
     # Use inference mode to compute some useful metrics on a fixed sample
     # Due to the batch being sharded on TPU, these metrics should be run on CPU
@@ -167,44 +168,45 @@ def build_model_fn(spec, config, num_train_images):
       return tf.contrib.tpu.TPUEstimatorSpec(mode=mode, predictions=predictions)
 
     if mode == tf.estimator.ModeKeys.TRAIN:
-      global_step = tf.train.get_or_create_global_step()
-      base_lr = config['learning_rate']
-      if config['use_tpu']:
-        base_lr *= config['tpu_num_shards']
+      with tf.variable_scope('lr_scheduling'):
+        global_step = tf.train.get_or_create_global_step()
+        base_lr = config['learning_rate']
+        if config['use_tpu']:
+          base_lr *= config['tpu_num_shards']
 
-      if config['lr_decay_method'] == 'COSINE_BY_STEP':
-        total_steps = int(config['train_epochs'] * num_train_images /
-                          config['batch_size'])
-        progress_fraction = tf.cast(global_step, tf.float32) / total_steps
-        learning_rate = (0.5 * base_lr *
-                         (1 + tf.cos(np.pi * progress_fraction)))
+        if config['lr_decay_method'] == 'COSINE_BY_STEP':
+          total_steps = int(config['train_epochs'] * num_train_images /
+                            config['batch_size'])
+          progress_fraction = tf.cast(global_step, tf.float32) / total_steps
+          learning_rate = (0.5 * base_lr *
+                           (1 + tf.cos(np.pi * progress_fraction)))
 
-      elif config['lr_decay_method'] == 'COSINE_BY_TIME':
-        # Requires training_time.limit hooks to be added to Estimator
-        elapsed_time = tf.cast(training_time.get_total_time(), dtype=tf.float32)
-        progress_fraction = elapsed_time / config['train_seconds']
-        learning_rate = (0.5 * base_lr *
-                         (1 + tf.cos(np.pi * progress_fraction)))
+        elif config['lr_decay_method'] == 'COSINE_BY_TIME':
+          # Requires training_time.limit hooks to be added to Estimator
+          elapsed_time = tf.cast(training_time.get_total_time(), dtype=tf.float32)
+          progress_fraction = elapsed_time / config['train_seconds']
+          learning_rate = (0.5 * base_lr *
+                           (1 + tf.cos(np.pi * progress_fraction)))
 
-      elif config['lr_decay_method'] == 'STEPWISE':
-        # divide LR by 10 at 1/2, 2/3, and 5/6 of total epochs
-        total_steps = (config['train_epochs'] * num_train_images /
-                       config['batch_size'])
-        boundaries = [int(0.5 * total_steps),
-                      int(0.667 * total_steps),
-                      int(0.833 * total_steps)]
-        values = [1.0 * base_lr,
-                  0.1 * base_lr,
-                  0.01 * base_lr,
-                  0.0001 * base_lr]
-        learning_rate = tf.train.piecewise_constant(
-            global_step, boundaries, values)
+        elif config['lr_decay_method'] == 'STEPWISE':
+          # divide LR by 10 at 1/2, 2/3, and 5/6 of total epochs
+          total_steps = (config['train_epochs'] * num_train_images /
+                         config['batch_size'])
+          boundaries = [int(0.5 * total_steps),
+                        int(0.667 * total_steps),
+                        int(0.833 * total_steps)]
+          values = [1.0 * base_lr,
+                    0.1 * base_lr,
+                    0.01 * base_lr,
+                    0.0001 * base_lr]
+          learning_rate = tf.train.piecewise_constant(
+              global_step, boundaries, values)
 
-      else:
-        raise ValueError('invalid lr_decay_method')
+        else:
+          raise ValueError('invalid lr_decay_method')
 
-      # Set LR to 0 for step 0 to initialize the weights without training
-      learning_rate = tf.where(tf.equal(global_step, 0), 0.0, learning_rate)
+        # Set LR to 0 for step 0 to initialize the weights without training
+        learning_rate = tf.where(tf.equal(global_step, 0), 0.0, learning_rate)
 
       optimizer = tf.train.RMSPropOptimizer(
           learning_rate=learning_rate,
@@ -458,4 +460,3 @@ def _covariance_matrix(activations):
   cov = squared / (tf.cast(tf.shape(flattened)[1], tf.float32) - 1)
 
   return cov
-

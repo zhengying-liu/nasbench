@@ -90,41 +90,44 @@ class CIFARInput(object):
     Returns:
       tf.data.Dataset object
     """
-    batch_size = params['batch_size']
-    is_training = (self.mode == 'train' or self.mode == 'augment')
+    with tf.name_scope(None, 'cifar_input'):
+      batch_size = params['batch_size']
+      is_training = (self.mode == 'train' or self.mode == 'augment')
 
-    dataset = tf.data.TFRecordDataset(self.data_files)
-    dataset = dataset.prefetch(buffer_size=batch_size)
+      dataset = tf.data.TFRecordDataset(self.data_files)
+      dataset = dataset.prefetch(buffer_size=batch_size)
 
-    # Repeat dataset for training modes
-    if is_training:
-      # Shuffle buffer with whole dataset to ensure full randomness per epoch
-      dataset = dataset.cache().apply(
-          tf.contrib.data.shuffle_and_repeat(
-              buffer_size=self.num_images))
+      # Repeat dataset for training modes
+      if is_training:
+        # Shuffle buffer with whole dataset to ensure full randomness per epoch
+        dataset = dataset.cache().apply(
+            tf.contrib.data.shuffle_and_repeat(
+                buffer_size=self.num_images))
 
-    # This is a hack to allow computing metrics on a fixed batch on TPU. Because
-    # TPU shards the batch acrosss cores, we replicate the fixed batch so that
-    # each core contains the whole batch.
-    if self.mode == 'sample':
-      dataset = dataset.repeat()
+      # This is a hack to allow computing metrics on a fixed batch on TPU. Because
+      # TPU shards the batch acrosss cores, we replicate the fixed batch so that
+      # each core contains the whole batch.
+      if self.mode == 'sample':
+        dataset = dataset.repeat()
 
-    # Parse, preprocess, and batch images
-    parser_fn = functools.partial(_parser, is_training)
-    dataset = dataset.apply(
-        tf.contrib.data.map_and_batch(
-            parser_fn,
-            batch_size=batch_size,
-            num_parallel_batches=self.config['tpu_num_shards'],
-            drop_remainder=True))
+      # Parse, preprocess, and batch images
+      parser_fn = functools.partial(_parser, is_training)
+      dataset = dataset.apply(
+          tf.contrib.data.map_and_batch(
+              parser_fn,
+              batch_size=batch_size,
+              num_parallel_batches=self.config['tpu_num_shards'],
+              drop_remainder=True))
 
-    # Assign static batch size dimension
-    dataset = dataset.map(functools.partial(_set_batch_dimension, batch_size))
+      # Assign static batch size dimension
+      dataset = dataset.map(functools.partial(_set_batch_dimension, batch_size))
 
-    # Prefetch to overlap in-feed with training
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+      # Prefetch to overlap in-feed with training
+      dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
 
-    return dataset
+      features, labels = dataset.make_one_shot_iterator().get_next()
+
+      return features, labels
 
 
 def _preprocess(image):
@@ -139,39 +142,41 @@ def _preprocess(image):
   Returns:
     preprocessed image with the same dimensions.
   """
-  # Pad 4 pixels on all sides with 0
-  image = tf.image.resize_image_with_crop_or_pad(
-      image, HEIGHT + 8, WIDTH + 8)
+  with tf.variable_scope(None, 'preprocess'):
+    # Pad 4 pixels on all sides with 0
+    image = tf.image.resize_image_with_crop_or_pad(
+        image, HEIGHT + 8, WIDTH + 8)
 
-  # Random crop
-  image = tf.random_crop(image, [HEIGHT, WIDTH, 3], seed=0)
+    # Random crop
+    image = tf.random_crop(image, [HEIGHT, WIDTH, 3], seed=0)
 
-  # Random flip
-  image = tf.image.random_flip_left_right(image, seed=0)
+    # Random flip
+    image = tf.image.random_flip_left_right(image, seed=0)
 
-  return image
+    return image
 
 
 def _parser(use_preprocessing, serialized_example):
   """Parses a single tf.Example into image and label tensors."""
-  features = tf.parse_single_example(
-      serialized_example,
-      features={
-          'image': tf.FixedLenFeature([], tf.string),
-          'label': tf.FixedLenFeature([], tf.int64),
-      })
-  image = tf.decode_raw(features['image'], tf.uint8)
-  image.set_shape([3 * HEIGHT * WIDTH])
-  image = tf.reshape(image, [3, HEIGHT, WIDTH])
-  # TODO(chrisying): handle NCHW format
-  image = tf.transpose(image, [1, 2, 0])
-  image = tf.cast(image, tf.float32)
-  if use_preprocessing:
-    image = _preprocess(image)
-  image -= tf.constant(RGB_MEAN, shape=[1, 1, 3])
-  image /= tf.constant(RGB_STD, shape=[1, 1, 3])
-  label = tf.cast(features['label'], tf.int32)
-  return image, label
+  with tf.variable_scope(None, 'parse_example'):
+    features = tf.parse_single_example(
+        serialized_example,
+        features={
+            'image': tf.FixedLenFeature([], tf.string),
+            'label': tf.FixedLenFeature([], tf.int64),
+        })
+    image = tf.decode_raw(features['image'], tf.uint8)
+    image.set_shape([3 * HEIGHT * WIDTH])
+    image = tf.reshape(image, [3, HEIGHT, WIDTH])
+    # TODO(chrisying): handle NCHW format
+    image = tf.transpose(image, [1, 2, 0])
+    image = tf.cast(image, tf.float32)
+    if use_preprocessing:
+      image = _preprocess(image)
+    image -= tf.constant(RGB_MEAN, shape=[1, 1, 3])
+    image /= tf.constant(RGB_STD, shape=[1, 1, 3])
+    label = tf.cast(features['label'], tf.int32)
+    return image, label
 
 
 def _set_batch_dimension(batch_size, images, labels):
